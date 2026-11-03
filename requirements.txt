@@ -1,0 +1,5 @@
+# LeadMiner X v3 — runtime dependencies
+# Minimum versions only; PyInstaller is a build-time tool and is installed
+# separately by the CI workflow (see .github/workflows/build-windows.yml).
+customtkinter>=5.2.2
+requests>=2.31.0
