@@ -1,0 +1,59 @@
+name: Build LeadMinerX
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyinstaller -r requirements.txt
+
+      - name: Build executable
+        run: pyinstaller LeadMinerX.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeadMinerX-windows
+          path: dist/LeadMinerX.exe
+
+      - name: Attach to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/LeadMinerX.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyinstaller -r requirements.txt
+
+      - name: Build executable
+        run: pyinstaller LeadMinerX.spec
+
+      - name: Zip the app
+        run: cd dist && zip LeadMinerX-macos.zip LeadMinerX
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeadMinerX-macos
+          path: dist/LeadMinerX-macos.zip
