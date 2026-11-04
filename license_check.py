@@ -44,7 +44,7 @@ CACHE_PATH = os.path.join(APP_DIR, "license.json")
 REVERIFY_DAYS = 7          # cached verifications are trusted this long
 TRIAL_LIMIT = 25           # free-trial leads before activation is required
 
-USER_AGENT = "LeadMinerX/3.0"
+USER_AGENT = "LeadMinerX/3.0.1"   # keep in sync with VERSION in leadminer_x.py
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,17 @@ def verify_license(key):
                 "Check your connection and try again.")
 
     if http_status == 200 and payload and payload.get("success"):
+        # Gumroad reports success=true even for a purchase that was later
+        # refunded or charged back — those keys must NOT unlock the app.
+        purchase = payload.get("purchase") or {}
+        if purchase.get("refunded") or purchase.get("chargebacked"):
+            cache = read_cache()
+            if cache is None or cache.get("key") == key:
+                _clear_cache()
+            return ("invalid",
+                    "This license key's purchase was refunded or charged "
+                    "back, so it no longer unlocks LeadMiner X. If you "
+                    "believe this is a mistake, please contact support.")
         _write_cache(key)
         return "valid", "License verified — unlimited mining unlocked."
 

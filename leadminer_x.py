@@ -65,7 +65,8 @@ from license_check import TRIAL_LIMIT
 # Configuration
 # ---------------------------------------------------------------------------
 
-APP_NAME = "LeadMiner X v3"
+VERSION = "3.0.1"
+APP_NAME = f"LeadMiner X v{VERSION}"
 
 DATA_KEYS = ["Name", "Category", "Rating", "Reviews",
              "Address", "Phone", "Website", "Search Location"]
@@ -85,7 +86,7 @@ PLACES_FIELD_MASK = (
 )
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-NOMINATIM_USER_AGENT = "LeadMinerX/3.0"
+NOMINATIM_USER_AGENT = f"LeadMinerX/{VERSION}"
 
 GRID_CELL_DEGREES = 0.03     # ~3.3 km cells
 GRID_MAX_CELLS = 16          # 4 x 4 — cells grow if the bbox needs more
@@ -309,7 +310,14 @@ class LeadPipeline:
         if not m:
             digits = re.sub(r"\D", "", text)
             return digits or "N/A"
-        num, suffix = float(m.group(1)), m.group(2)
+        try:
+            num = float(m.group(1))
+        except ValueError:
+            # e.g. "1.2.3" matches [\d.]+ but is not a number — degrade
+            # to the bare digits instead of raising into the worker.
+            digits = re.sub(r"\D", "", text)
+            return digits or "N/A"
+        suffix = m.group(2)
         return str(int(num * {"": 1, "K": 1_000, "M": 1_000_000}[suffix]))
 
     @staticmethod
@@ -443,7 +451,10 @@ class PlacesAPIEngine:
         self.p = pipeline
         self.api_key = api_key
 
-    def _request(self, text_query, page_token=None, rectangle=None):
+    MAX_429_RETRIES = 3
+
+    def _request(self, text_query, page_token=None, rectangle=None,
+                 attempt=0):
         body = {"textQuery": text_query, "pageSize": 20}
         if page_token:
             body["pageToken"] = page_token
@@ -455,20 +466,43 @@ class PlacesAPIEngine:
                     "high": {"latitude": high_lat, "longitude": high_lon},
                 }
             }
-        resp = requests.post(
-            PLACES_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "X-Goog-Api-Key": self.api_key,
-                "X-Goog-FieldMask": PLACES_FIELD_MASK,
-            },
-            json=body,
-            timeout=30,
-        )
+        try:
+            resp = requests.post(
+                PLACES_API_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Key": self.api_key,
+                    "X-Goog-FieldMask": PLACES_FIELD_MASK,
+                },
+                json=body,
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            # A dropped connection must end the search with an explanation
+            # in the log — never kill the worker thread silently.
+            self.p.log(f"[-] Network error — could not reach Google "
+                       f"Places ({exc}). This search stopped; leads "
+                       f"already saved are kept.")
+            return None
         if resp.status_code == 429:
-            self.p.log("[!] Rate limited (429) — backing off 10s.")
-            time.sleep(10)
-            return self._request(text_query, page_token, rectangle)
+            # Bounded retries, and the backoff is interruptible: a
+            # persistent 429 usually means the monthly quota is gone, so
+            # retrying forever (the old behavior) hung the run and the
+            # Stop button could not interrupt the sleep.
+            if (attempt < self.MAX_429_RETRIES
+                    and not self.p.stop_event.is_set()):
+                wait = 10 * (attempt + 1)
+                self.p.log(f"[!] Rate limited (429) — backing off {wait}s "
+                           f"(retry {attempt + 1}/"
+                           f"{self.MAX_429_RETRIES}).")
+                if self.p.stop_event.wait(wait):
+                    return None
+                return self._request(text_query, page_token, rectangle,
+                                     attempt + 1)
+            self.p.log("[-] Still rate limited after retries — the "
+                       "monthly Places quota may be used up. Stopping "
+                       "this search; leads already saved are kept.")
+            return None
         if resp.status_code != 200:
             _, err = _places_error(resp)
             self.p.log(f"[-] Places API error {resp.status_code}: {err}")
@@ -563,7 +597,14 @@ class PlacesAPIEngine:
             self.p.log("[!] Free trial limit reached — "
                        "activate to continue.")
             return
-        self.p.open_csv(output_csv)
+        try:
+            self.p.open_csv(output_csv)
+        except OSError as exc:
+            self.p.log(f"[-] Could not open the output file "
+                       f"'{output_csv}' ({exc}). Choose a folder that "
+                       f"exists and a file you can write to, then run "
+                       f"again.")
+            return
         try:
             for keyword, location in jobs:
                 if self.p.stop_event.is_set():
@@ -573,6 +614,9 @@ class PlacesAPIEngine:
                     self.run_grid_job(keyword, location)
                 else:
                     self.run_job(keyword, location)
+        except Exception as exc:  # noqa: BLE001 — worker must not die mute
+            self.p.log(f"[-] Unexpected error — run stopped early "
+                       f"({exc}). Leads already saved are kept.")
         finally:
             self.p.close_csv()
         self.p.log(f"[✓] Done. {self.p.total} new lead(s) streamed to "
@@ -602,6 +646,7 @@ if HAS_CTK:
             self.status_queue = queue.Queue()
             self.stop_event = threading.Event()
             self.worker_thread = None
+            self._run_active = False
 
             self.store = LeadStore()
             self.licensed = False
@@ -859,6 +904,7 @@ if HAS_CTK:
                 or os.environ.get("GOOGLE_PLACES_API_KEY", "")
             engine = PlacesAPIEngine(pipeline, key)
             deep = self.deep_sweep_var.get()
+            self._run_active = True
             self.worker_thread = threading.Thread(
                 target=engine.run, args=(jobs, out, deep), daemon=True)
             self.worker_thread.start()
@@ -869,7 +915,10 @@ if HAS_CTK:
         def stop_mining(self):
             self.stop_event.set()
             self.log_queue.put("[!] Stopping...")
-            self.start_btn.configure(state="normal")
+            # Do NOT re-enable Start here: the worker may still be
+            # finishing (an in-flight request, a backoff wait). Starting
+            # a second run now would put two writers on the same CSV.
+            # poll_queues re-enables Start once the thread has exited.
             self.stop_btn.configure(state="disabled")
 
         # -- queues -------------------------------------------------------------------
@@ -884,8 +933,9 @@ if HAS_CTK:
                     self._apply_license_result(*payload)
                 elif kind == "keytest":
                     self._apply_keytest_result(*payload)
-            if (self.worker_thread and not self.worker_thread.is_alive()
-                    and self.stop_btn.cget("state") == "normal"):
+            if (self._run_active and self.worker_thread
+                    and not self.worker_thread.is_alive()):
+                self._run_active = False
                 self.start_btn.configure(state="normal")
                 self.stop_btn.configure(state="disabled")
                 self._refresh_counts()   # trial + history moved during run
