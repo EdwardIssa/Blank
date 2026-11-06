@@ -15,6 +15,7 @@ import csv
 import json
 import os
 import queue
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -180,6 +181,12 @@ class TestPipeline(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.csv_path = os.path.join(self.tmp, "out.csv")
+        # Enrichment fetches lead websites via requests.get — keep the
+        # suite hermetic: every site reads as an empty page (no email).
+        patcher = mock.patch("requests.get",
+                             return_value=FakeResp(200, text=""))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _record(self, name="Alpha Dentists", addr="1 Main St"):
         return {"Name": name, "Category": "Dentist", "Rating": "4.5",
@@ -368,6 +375,12 @@ class TestEngine(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.csv_path = os.path.join(self.tmp, "out.csv")
+        # Same hermetic guard as TestPipeline: enrichment's website
+        # fetches see an empty page, never the live network.
+        patcher = mock.patch("requests.get",
+                             return_value=FakeResp(200, text=""))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _two_page_stub(self, calls):
         def stub(url, headers=None, json=None, timeout=None):
@@ -531,6 +544,234 @@ class TestGrid(unittest.TestCase):
             bbox, reason = lx.geocode_bbox("Nowhere ZZ")
         self.assertIsNone(bbox)
         self.assertIsNotNone(reason)
+
+
+# ---------------------------------------------------------------------------
+# Email enrichment (v3.1): website fetches stubbed per-URL
+# ---------------------------------------------------------------------------
+
+class FakePage:
+    """Stand-in for requests.Response on a website fetch."""
+
+    def __init__(self, text="", status_code=200):
+        self.status_code = status_code
+        self.text = text
+
+
+def site_stub(pages, calls=None, fail=()):
+    """requests.get stand-in: serves `pages` {url: html}, raises
+    ConnectionError for urls in `fail`, 404s everything else."""
+    def stub(url, headers=None, timeout=None):
+        if calls is not None:
+            calls.append((url, timeout))
+        if url in fail:
+            raise requests.ConnectionError("dead site")
+        if url in pages:
+            return FakePage(pages[url])
+        return FakePage("", 404)
+    return stub
+
+
+class TestEmailEnrichment(unittest.TestCase):
+    def test_mailto_extraction(self):
+        pages = {"https://alpha.example":
+                 '<a href="mailto:info@alpha.example">Email us</a>'}
+        calls = []
+        with mock.patch("requests.get", side_effect=site_stub(pages, calls)):
+            email = lx.find_business_email("https://alpha.example")
+        self.assertEqual(email, "info@alpha.example")
+        # info@ on the business's own domain is the best possible find:
+        # enrichment stops after the homepage instead of fetching more.
+        self.assertEqual(len(calls), 1)
+
+    def test_plain_text_email(self):
+        pages = {"https://beta.example":
+                 "<p>Reach the office at office@beta.example any time.</p>"}
+        with mock.patch("requests.get", side_effect=site_stub(pages)):
+            email = lx.find_business_email("https://beta.example")
+        self.assertEqual(email, "office@beta.example")
+
+    def test_obfuscated_email(self):
+        pages = {"https://gamma.example":
+                 "<p>Say hi: hello [at] gamma [dot] example</p>"}
+        with mock.patch("requests.get", side_effect=site_stub(pages)):
+            email = lx.find_business_email("https://gamma.example")
+        self.assertEqual(email, "hello@gamma.example")
+
+    def test_obfuscation_variants(self):
+        found = lx.extract_emails(
+            "tom(at)shop.example, or jane at shop dot example")
+        self.assertIn("tom@shop.example", found)
+        self.assertIn("jane@shop.example", found)
+
+    def test_asset_filename_rejected(self):
+        # "logo@2x.png" looks email-shaped to a regex but is an image.
+        pages = {"https://img.example":
+                 '<img src="logo@2x.png"><img src="icon@2x.svg">'}
+        with mock.patch("requests.get", side_effect=site_stub(pages)):
+            email = lx.find_business_email("https://img.example")
+        self.assertEqual(email, "")
+
+    def test_junk_rejected(self):
+        pages = {"https://delta.example": (
+            "<p>Errors: abc123@o42.ingest.sentry.io</p>"
+            '<a href="mailto:noreply@delta.example">x</a>'
+            "<p>Template: you@example.com</p>")}
+        with mock.patch("requests.get", side_effect=site_stub(pages)):
+            email = lx.find_business_email("https://delta.example")
+        self.assertEqual(email, "")
+
+    def test_domain_match_ranking(self):
+        # Domain match beats a role inbox on another domain; a role
+        # inbox on the business's own domain beats a personal name on it.
+        self.assertEqual(
+            lx.pick_best_email(["info@other.example", "jane@biz.example"],
+                               "biz.example"),
+            "jane@biz.example")
+        self.assertEqual(
+            lx.pick_best_email(["jane@biz.example", "info@biz.example"],
+                               "biz.example"),
+            "info@biz.example")
+        pages = {
+            "https://epsilon.example":
+                '<p>jane@epsilon.example — or epsilonbiz@gmail.com</p>'
+                '<a href="/contact">Contact</a>',
+            "https://epsilon.example/contact":
+                "<p>info@epsilon.example</p>",
+        }
+        with mock.patch("requests.get", side_effect=site_stub(pages)):
+            email = lx.find_business_email("https://epsilon.example")
+        self.assertEqual(email, "info@epsilon.example")
+
+    def test_no_email_site(self):
+        pages = {"https://quiet.example":
+                 "<p>Call us! Use the form below.</p>"}
+        with mock.patch("requests.get", side_effect=site_stub(pages)):
+            email = lx.find_business_email("https://quiet.example")
+        self.assertEqual(email, "")
+
+    def test_contact_link_discovery(self):
+        pages = {
+            "https://zeta.example":
+                '<a href="/contact-us">Contact us</a><p>No email here.</p>',
+            "https://zeta.example/contact-us":
+                "<p>bookings@zeta.example</p>",
+        }
+        calls = []
+        with mock.patch("requests.get", side_effect=site_stub(pages, calls)):
+            email = lx.find_business_email("https://zeta.example")
+        self.assertEqual(email, "bookings@zeta.example")
+        self.assertIn("https://zeta.example/contact-us",
+                      [url for url, _ in calls])
+
+    def test_fetch_failure_returns_empty(self):
+        fail = ("https://dead.example", "https://dead.example/contact",
+                "https://dead.example/contact-us")
+        with mock.patch("requests.get", side_effect=site_stub({}, fail=fail)):
+            email = lx.find_business_email("https://dead.example")
+        self.assertEqual(email, "")
+
+    def test_fetch_timeout_bounded(self):
+        pages = {"https://slow.example": "<p>nothing here</p>"}
+        calls = []
+        with mock.patch("requests.get", side_effect=site_stub(pages, calls)):
+            lx.find_business_email("https://slow.example")
+        self.assertTrue(calls)
+        self.assertLessEqual(lx.ENRICH_TIMEOUT, 10)
+        for _, timeout in calls:
+            self.assertEqual(timeout, lx.ENRICH_TIMEOUT)
+
+    def test_stop_event_skips_fetches(self):
+        stop = threading.Event()
+        stop.set()
+        with mock.patch("requests.get") as get:
+            email = lx.find_business_email("https://alpha.example", stop)
+        self.assertEqual(email, "")
+        get.assert_not_called()
+
+    # -- pipeline level: the Email column + the store ---------------------
+
+    def _record(self, website="https://alpha.example"):
+        return {"Name": "Alpha Dentists", "Category": "Dentist",
+                "Rating": "4.5", "Reviews": "240",
+                "Address": "1 Main St, Austin, TX",
+                "Phone": "+15125550100", "Website": website,
+                "Search Location": "Austin, TX"}
+
+    def test_pipeline_email_written_and_stored(self):
+        tmp = tempfile.mkdtemp()
+        csv_path = os.path.join(tmp, "out.csv")
+        pages = {"https://alpha.example":
+                 '<a href="mailto:info@alpha.example">Email us</a>'}
+        with mock.patch("requests.get", side_effect=site_stub(pages)):
+            pipe, _, _, store = make_pipeline(tmp)
+            pipe.open_csv(csv_path)
+            self.assertTrue(pipe.add_record(self._record(), "pid-a"))
+            pipe.close_csv()
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            rows = list(reader)
+        # Email sits immediately after Website in the column order.
+        keys = reader.fieldnames
+        self.assertEqual(keys[keys.index("Website") + 1], "Email")
+        self.assertEqual(rows[0]["Email"], "info@alpha.example")
+        self.assertEqual(
+            store.email_for("pid-a", "Alpha Dentists",
+                            "1 Main St, Austin, TX"),
+            "info@alpha.example")
+
+    def test_pipeline_fetch_failure_still_saves(self):
+        tmp = tempfile.mkdtemp()
+        csv_path = os.path.join(tmp, "out.csv")
+        with mock.patch("requests.get",
+                        side_effect=requests.ConnectionError("down")):
+            pipe, _, _, _ = make_pipeline(tmp)
+            pipe.open_csv(csv_path)
+            self.assertTrue(pipe.add_record(self._record(), "pid-a"))
+            pipe.close_csv()
+        self.assertEqual(pipe.total, 1)
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual(rows[0]["Email"], "")
+
+    def test_pipeline_no_website_no_fetch(self):
+        tmp = tempfile.mkdtemp()
+        csv_path = os.path.join(tmp, "out.csv")
+        with mock.patch("requests.get") as get:
+            pipe, _, _, _ = make_pipeline(tmp)
+            pipe.open_csv(csv_path)
+            self.assertTrue(
+                pipe.add_record(self._record(website="N/A"), "pid-a"))
+            pipe.close_csv()
+        get.assert_not_called()
+
+    def test_db_migration_old_schema(self):
+        # A v3.0.x database: seen_leads WITHOUT the email column, with a
+        # lead already in it. Opening the store must upgrade in place.
+        tmp = tempfile.mkdtemp()
+        db = os.path.join(tmp, "leads.db")
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """CREATE TABLE seen_leads (
+                   place_id TEXT, name_key TEXT NOT NULL,
+                   address_key TEXT NOT NULL, name TEXT, address TEXT,
+                   first_seen TEXT NOT NULL)""")
+        conn.execute(
+            "INSERT INTO seen_leads VALUES "
+            "('pid-old', 'alpha', '1 main st', 'Alpha', '1 Main St', "
+            "'2026-11-03 00:00:00')")
+        conn.commit()
+        conn.close()
+        store = lx.LeadStore(db)   # must not raise, must not lose the row
+        cols = {row[1] for row in store._conn.execute(
+            "PRAGMA table_info(seen_leads)")}
+        self.assertIn("email", cols)
+        self.assertEqual(store.count(), 1)
+        self.assertEqual(store.email_for("pid-old", "Alpha", "1 Main St"),
+                         "")
+        store.add("pid-new", "Beta", "2 Oak Ave", "info@beta.example")
+        self.assertEqual(store.email_for("pid-new", "Beta", "2 Oak Ave"),
+                         "info@beta.example")
 
 
 if __name__ == "__main__":

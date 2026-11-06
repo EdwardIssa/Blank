@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.0 — 2026-11-05 (email enrichment)
+
+- **Added:** Email column (after Website). For every lead with a
+  website, the run now reads the business's own site — homepage plus
+  up to two likely contact pages — and records the most business-like
+  address the business itself publishes (its own domain preferred,
+  customer-facing inboxes like info@/contact@ first). Mailto links,
+  plain-text addresses, and lightly obfuscated forms ("name [at]
+  site [dot] com") are recognized; placeholders, error-tracker
+  addresses, image filenames, and noreply@ senders are filtered out.
+  No third-party lookup APIs; a business that publishes no email gets
+  an empty cell. Found emails persist in the lead-history database
+  (existing databases upgrade in place). Every site fetch is capped
+  at 10 seconds and honors Stop, so a dead site can never hang a run.
+
 ## 3.0.1 — 2026-11-04 (tightening pass)
 
 - **Fixed:** a persistent HTTP 429 (e.g. the monthly Places quota running

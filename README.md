@@ -1,9 +1,9 @@
-# LeadMiner X v3
+# LeadMiner X v3.1
 
 Desktop lead-extraction tool for Windows: business listings (name, category,
-rating, review count, address, phone, website) streamed to CSV — powered by
-Google's official **Places API (New)**. You bring your own Google API key;
-everything runs on your machine.
+rating, review count, address, phone, website, email) streamed to CSV —
+powered by Google's official **Places API (New)**. You bring your own
+Google API key; everything runs on your machine.
 
 ## Why the official API
 
@@ -23,6 +23,18 @@ billing account is required even to use the free cap. (Source: Google
 Maps Platform pricing list, checked 2026-11-03 —
 https://developers.google.com/maps/billing-and-pricing/pricing)
 
+## What's new in v3.1
+
+- **Email enrichment** — the Places API never returns an email address,
+  so for every lead with a website, LeadMiner now reads the business's
+  own site (its homepage plus up to two likely contact pages) and adds
+  the best published address to a new **Email** column, right after
+  Website. Only addresses the business itself publishes are collected —
+  nothing is guessed and no third-party lookup service is used. Expect
+  roughly half of website-owning businesses to publish one; the rest
+  (contact-form-only sites) simply get an empty cell. Found emails are
+  remembered in your lead history alongside the lead.
+
 ## What's new in v3
 
 - **Persistent dedup database** — every lead ever mined is remembered
@@ -40,6 +52,8 @@ https://developers.google.com/maps/billing-and-pricing/pricing)
 
 ## Features
 
+- **Email column** — the address each business publishes on its own
+  website, collected during the same run at no extra API cost
 - Single search or **bulk mode** (`keyword | location` per line)
 - **Thread-safe design** — worker thread + queue-based logging + cooperative
   stop flag; stop anytime and keep every row already mined

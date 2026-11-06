@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LeadMiner X v3 — commercial lead extraction (2026-11-03)
+LeadMiner X — commercial lead extraction (v3 2026-11-03; v3.1 2026-11-05)
 
 Single engine: the official Google Places API (New). The v2 browser
 scraper is gone — automating google.com/maps violates Google's Terms of
@@ -21,6 +21,12 @@ What v3 adds over v2:
   * LICENSE GATE — free trial of 25 leads (counter persisted in the same
     SQLite DB); a Gumroad license key (see license_check.py) unlocks
     unlimited mining.
+  * EMAIL ENRICHMENT (v3.1) — Places never returns an email address, so
+    for every lead with a website the engine reads the business's own
+    site (homepage + up to two likely contact pages) and records the
+    most business-like address the business itself publishes there.
+    Nothing is guessed and no third-party lookup service is used; a
+    business that publishes no email simply gets an empty Email cell.
 
 Design kept from v2: worker-thread execution, queue-based UI logging,
 cooperative stop flag, streaming CSV (append + flush per record), phone
@@ -65,11 +71,11 @@ from license_check import TRIAL_LIMIT
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION = "3.0.1"
+VERSION = "3.1.0"
 APP_NAME = f"LeadMiner X v{VERSION}"
 
 DATA_KEYS = ["Name", "Category", "Rating", "Reviews",
-             "Address", "Phone", "Website", "Search Location"]
+             "Address", "Phone", "Website", "Email", "Search Location"]
 
 APP_DIR = os.path.join(os.path.expanduser("~"), ".leadminer")
 DB_PATH = os.path.join(APP_DIR, "leads.db")
@@ -143,6 +149,14 @@ class LeadStore:
                        key   TEXT PRIMARY KEY,
                        value TEXT NOT NULL
                    )""")
+            # v3.1: seen_leads gained an email column (the address found
+            # on the business's own website). Upgrade an older database
+            # in place — never drop or rebuild the user's history.
+            columns = {row[1] for row in self._conn.execute(
+                "PRAGMA table_info(seen_leads)")}
+            if "email" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE seen_leads ADD COLUMN email TEXT")
 
     # -- key normalization --------------------------------------------------
     @staticmethod
@@ -171,15 +185,33 @@ class LeadStore:
                     (name_key, address_key)).fetchone()
         return row is not None
 
-    def add(self, place_id, name, address):
+    def add(self, place_id, name, address, email=""):
         """Remember a lead as seen. Safe against races (INSERT OR IGNORE)."""
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT OR IGNORE INTO seen_leads "
-                "(place_id, name_key, address_key, name, address, first_seen) "
-                "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                "(place_id, name_key, address_key, name, address, "
+                "first_seen, email) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now'), ?)",
                 (place_id or None, self._name_key(name),
-                 self._address_key(address), name, address))
+                 self._address_key(address), name, address, email or ""))
+
+    def email_for(self, place_id, name, address):
+        """The email stored with a seen lead ('' when none was found)."""
+        name_key = self._name_key(name)
+        address_key = self._address_key(address)
+        with self._lock:
+            if place_id:
+                row = self._conn.execute(
+                    "SELECT email FROM seen_leads WHERE place_id = ? "
+                    "OR (name_key = ? AND address_key = ?) LIMIT 1",
+                    (place_id, name_key, address_key)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT email FROM seen_leads "
+                    "WHERE name_key = ? AND address_key = ? LIMIT 1",
+                    (name_key, address_key)).fetchone()
+        return (row[0] or "") if row else ""
 
     def count(self):
         """Total leads in history (all runs, all time)."""
@@ -288,13 +320,26 @@ class LeadPipeline:
                 self.stop_event.set()
                 return False
             self.store.increment_trial()
-        self.store.add(place_id, name, record.get("Address", ""))
+        # Email enrichment runs only for leads actually being written —
+        # never for duplicates or past the trial gate — and is fail-soft:
+        # a dead or hostile site yields an empty Email, never a lost row.
+        email = ""
+        website = record.get("Website", "")
+        if website and website != "N/A":
+            try:
+                email = find_business_email(website, self.stop_event)
+            except Exception:  # noqa: BLE001 — enrichment must not kill a row
+                email = ""
+        record["Email"] = email
+        self.store.add(place_id, name, record.get("Address", ""), email)
         # Single writer thread => appends are effectively atomic; flush so a
         # crash loses at most the in-flight row, never the run.
         self._csv_writer.writerow(record)
         self._csv_file.flush()
         self.total += 1
         self.log(f"[✓] Scraped ({self.total}): {name.strip()}")
+        if email:
+            self.log(f"    └ email: {email}")
         return True
 
     # -- parsing helpers --------------------------------------------------
@@ -330,6 +375,219 @@ class LeadPipeline:
         if len(digits) == 11 and digits.startswith("1"):
             return "+" + digits
         return "+" + digits if digits else "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Email enrichment: the address a business publishes on its own website
+# ---------------------------------------------------------------------------
+# Places never returns an email, so enrichment reads the site itself: the
+# homepage plus up to two likely contact pages. Only addresses the
+# business itself publishes are collected — nothing is guessed, and no
+# third-party lookup API is involved (BYOK purity). Every fetch is
+# hard-capped and honors the run's stop flag, so a dead, blocked, or
+# slow site costs a few seconds at worst and can never hang the run.
+
+ENRICH_TIMEOUT = 10            # hard cap per fetch, seconds
+ENRICH_MAX_PAGES = 3           # homepage + up to 2 contact pages
+ENRICH_PAGE_BUDGET = 512_000   # read at most ~512 KB of any page
+ENRICH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_MAILTO_RE = re.compile(r"mailto:([^\"'<>?\s]+)", re.IGNORECASE)
+_OBFUSCATED_RE = re.compile(
+    r"([A-Za-z0-9._%+\-]+)"
+    r"(?:\s*\[at\]\s*|\s*\(at\)\s*|\s*\{at\}\s*|\s+at\s+)"
+    r"([A-Za-z0-9.\-]+?)"
+    r"(?:\s*\[dot\]\s*|\s*\(dot\)\s*|\s*\{dot\}\s*|\s+dot\s+|\.)"
+    r"([A-Za-z]{2,})",
+    re.IGNORECASE)
+# In the word form ("name at site dot com") the token before "at" can
+# be ordinary prose ("email us at gmail dot com") — never let a prose
+# word become a fabricated local part.
+_WORD_FORM_STOPLOCALS = {"us", "me", "it"}
+_HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+# Candidates that merely LOOK like emails: image/asset filenames
+# ("logo@2x.png"), error-tracker ingest addresses (…@….ingest.sentry.io),
+# placeholder domains (example.com), and send-only inboxes (noreply@…)
+# are not leads and are always dropped.
+_ASSET_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+                   ".ico", ".css", ".js", ".woff", ".woff2")
+_JUNK_LOCALS = {"noreply", "no-reply", "donotreply", "do-not-reply",
+                "mailer-daemon"}
+# Role inboxes a business publishes for customers to reach it, best first.
+_ROLE_LOCALS = ("info", "contact", "hello", "office", "sales",
+                "bookings", "booking", "support", "admin", "orders")
+_CONTACT_HINTS = ("contact", "about")
+_COMMON_CONTACT_PATHS = ("/contact", "/contact-us")
+
+
+def _site_domain(url):
+    """'https://www.alpha.com/x' -> 'alpha.com' ('' when unparseable)."""
+    host = urllib.parse.urlparse(url).netloc.lower()
+    host = host.split("@")[-1].split(":")[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def _email_domain(email):
+    return email.rsplit("@", 1)[-1].lower() if "@" in email else ""
+
+
+def _is_junk_email(email):
+    lowered = email.lower()
+    if lowered.endswith(_ASSET_SUFFIXES):
+        return True
+    local, _, domain = lowered.partition("@")
+    if not local or not domain or "." not in domain:
+        return True
+    if local in _JUNK_LOCALS or local.startswith("noreply"):
+        return True
+    if domain.startswith("example.") or domain == "domain.com":
+        return True
+    if "sentry" in domain:      # error-tracker ingest, not a mailbox
+        return True
+    return False
+
+
+def extract_emails(html):
+    """All plausible published addresses in a page, best source first:
+    mailto: links (deliberate), then plain text, then light obfuscation
+    ('name [at] site [dot] com'). Junk is filtered; order is preserved
+    and duplicates removed so ranking stays deterministic."""
+    if not html:
+        return []
+    found = []
+
+    def _add(candidate):
+        candidate = candidate.strip().strip(".,;:()<>[]\"'")
+        if candidate and candidate.lower() not in \
+                {c.lower() for c in found}:
+            if not _is_junk_email(candidate):
+                found.append(candidate)
+
+    for match in _MAILTO_RE.finditer(html):
+        _add(urllib.parse.unquote(match.group(1)))
+    for match in _EMAIL_RE.finditer(html):
+        _add(match.group(0))
+    for match in _OBFUSCATED_RE.finditer(html):
+        if " at " in match.group(0).lower() and \
+                match.group(1).lower() in _WORD_FORM_STOPLOCALS:
+            continue     # prose ("email us at …"), not an obfuscated email
+        _add(f"{match.group(1)}@{match.group(2)}.{match.group(3)}")
+    return found
+
+
+def _candidate_rank(email, site_domain, index):
+    """Lower is better. A business's own domain beats any other domain;
+    within a tier, a customer-facing role inbox beats a personal name;
+    remaining ties keep the order the page presented them in."""
+    domain = _email_domain(email)
+    on_domain = 0 if site_domain and (
+        domain == site_domain or domain.endswith("." + site_domain)) else 1
+    local = email.split("@", 1)[0].lower()
+    role = _ROLE_LOCALS.index(local) if local in _ROLE_LOCALS \
+        else len(_ROLE_LOCALS)
+    return (on_domain, role, index)
+
+
+def pick_best_email(candidates, site_domain):
+    """The single primary email for a lead ('' when there are none)."""
+    if not candidates:
+        return ""
+    ranked = sorted(
+        enumerate(candidates),
+        key=lambda pair: _candidate_rank(pair[1], site_domain, pair[0]))
+    return ranked[0][1]
+
+
+def _fetch_page(url, stop_event):
+    """GET one page, or None on any failure. Never raises, never hangs
+    past ENRICH_TIMEOUT, and refuses to start once Stop was pressed."""
+    if stop_event is not None and stop_event.is_set():
+        return None
+    try:
+        resp = requests.get(url, headers={"User-Agent": ENRICH_USER_AGENT},
+                            timeout=ENRICH_TIMEOUT)
+    except requests.RequestException:
+        return None
+    if getattr(resp, "status_code", None) != 200:
+        return None
+    return (resp.text or "")[:ENRICH_PAGE_BUDGET]
+
+
+def _contact_page_urls(html, base_url):
+    """Up to 2 same-site contact/about URLs: the site's own links when
+    it offers them, else the common paths every site builder uses."""
+    base_domain = _site_domain(base_url)
+    urls = []
+    for href in _HREF_RE.findall(html or ""):
+        lowered = href.lower()
+        if not any(hint in lowered for hint in _CONTACT_HINTS):
+            continue
+        absolute = urllib.parse.urljoin(base_url, href)
+        if _site_domain(absolute) != base_domain:
+            continue
+        if absolute.rstrip("/") == base_url.rstrip("/"):
+            continue
+        if absolute not in urls:
+            urls.append(absolute)
+        if len(urls) >= ENRICH_MAX_PAGES - 1:
+            break
+    if not urls:
+        parts = urllib.parse.urlparse(base_url)
+        origin = f"{parts.scheme}://{parts.netloc}"
+        urls = [origin + path for path in _COMMON_CONTACT_PATHS]
+    return urls
+
+
+def find_business_email(website, stop_event=None):
+    """The primary email a business publishes on its own website.
+
+    Returns '' when the business publishes none, when the site cannot
+    be read, or when the run was stopped. Reads the homepage, then up
+    to two likely contact pages — stopping early once a page yields a
+    customer-facing inbox on the business's own domain (the best
+    possible find), so the common case costs a single fetch.
+    """
+    if not HAS_REQUESTS or not website:
+        return ""
+    url = website.strip()
+    if not url or url == "N/A":
+        return ""
+    if "://" not in url:
+        url = "https://" + url
+    site_domain = _site_domain(url)
+    if not site_domain:
+        return ""
+    candidates = []
+    pages = [url]
+    for index, page_url in enumerate(pages):
+        if index > 0 and stop_event is not None and stop_event.is_set():
+            break
+        html = _fetch_page(page_url, stop_event)
+        if index == 0:
+            # Contact-page candidates come from the homepage's own
+            # links — or, when the homepage itself could not be read,
+            # from the common paths on the same origin.
+            if html:
+                pages.extend(_contact_page_urls(html, url))
+            else:
+                parts = urllib.parse.urlparse(url)
+                origin = f"{parts.scheme}://{parts.netloc}"
+                pages.extend(origin + path
+                             for path in _COMMON_CONTACT_PATHS)
+        if html is None:
+            continue
+        candidates.extend(
+            e for e in extract_emails(html) if e not in candidates)
+        best = pick_best_email(candidates, site_domain)
+        if best:
+            tier = _candidate_rank(best, site_domain, 0)
+            if tier[0] == 0 and tier[1] < len(_ROLE_LOCALS):
+                break    # role inbox on the business's own domain: done
+    return pick_best_email(candidates, site_domain)
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +787,7 @@ class PlacesAPIEngine:
                 place.get("nationalPhoneNumber")
                 or place.get("internationalPhoneNumber", "N/A")),
             "Website": place.get("websiteUri", "N/A"),
+            "Email": "",   # filled by pipeline enrichment (own website)
             "Search Location": location,
         }
         return record, place.get("id"), status
@@ -664,7 +923,8 @@ if HAS_CTK:
             ctk.CTkLabel(
                 self,
                 text="Official Google Places API engine — every lead "
-                     "field in one call (~$0.002/lead).",
+                     "field in one call (~$0.002/lead), plus the email "
+                     "each business publishes on its own website.",
                 text_color="#2e7d32").pack(pady=(10, 2), padx=12)
 
             # -- API key --------------------------------------------------
